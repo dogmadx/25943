@@ -60,7 +60,7 @@ int main(void) {
         line_count++;
     }
 
-    printf("\n%-8s %-8s %-8s\n", "Строка", "Отступ", "Длина");
+    printf("\n%-8s %-8s %-8s\n", "строка", "отступ", "длина");
     for (size_t i = 0; i < line_count; i++)
         printf("%-8zu %-8lld %-8zu\n", i + 1, (long long)table[i].offset, table[i].length);
     printf("\n");
