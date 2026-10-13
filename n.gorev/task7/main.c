@@ -3,19 +3,19 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #include <termios.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 typedef struct {
     off_t offset;
     size_t length;
 } LineInfo;
 
-struct termios saved; /* настройки терминала до ввода */
-int raw_mode = 0;     /* 1 — терминал сейчас в нашем режиме */
+struct termios saved;
+int raw_mode = 0;
 
-/* Ввод в буфер по одному символу. На экран попадают только допустимые символы,
-   стрелки, табы и прочие служебные клавиши пропускаются.
-   digits = 1 — разрешены только цифры. Возвращает длину строки или -1 (Ctrl+D, Ctrl+C) */
 int read_input(char *buf, int size, int digits) {
     int tty = isatty(0);
     fflush(stdout);
@@ -24,7 +24,7 @@ int read_input(char *buf, int size, int digits) {
         struct termios raw;
         tcgetattr(0, &saved);
         raw = saved;
-        raw.c_lflag &= ~(ICANON | ECHO | ISIG); /* без построчного ввода, без эха, без Ctrl+C */
+        raw.c_lflag &= ~(ICANON | ECHO | ISIG);
         raw.c_cc[VMIN] = 1;
         raw.c_cc[VTIME] = 0;
         tcsetattr(0, TCSANOW, &raw);
@@ -35,7 +35,7 @@ int read_input(char *buf, int size, int digits) {
     while (1) {
         int c = getchar();
 
-        if (c == EOF || c == 4 || c == 3) { /* конец ввода, Ctrl+D, Ctrl+C */
+        if (c == EOF || c == 4 || c == 3) {
             len = -1;
             break;
         }
@@ -45,7 +45,9 @@ int read_input(char *buf, int size, int digits) {
             break;
         }
 
-        if (c == 127 || c == '\b') {        /* backspace — стираем символ и с экрана */
+        if (c == 127 || c == '\b') {
+            while (len > 0 && ((unsigned char)buf[len - 1] & 0xC0) == 0x80)
+                len--;
             if (len > 0) {
                 len--;
                 if (tty) printf("\b \b");
@@ -54,7 +56,7 @@ int read_input(char *buf, int size, int digits) {
             continue;
         }
 
-        if (c == 27) {                      /* стрелки и т.п.: ESC [ ... буква */
+        if (c == 27) {
             c = getchar();
             if (c == '[' || c == 'O')
                 while ((c = getchar()) != EOF && !(c >= 0x40 && c <= 0x7E))
@@ -62,8 +64,8 @@ int read_input(char *buf, int size, int digits) {
             continue;
         }
 
-        if (digits ? !isdigit(c) : !isgraph(c))
-            continue;                       /* таб, пробел, служебные — не берём */
+        if (digits ? !isdigit(c) : (c < 0x80 && !isgraph(c)))
+            continue;
 
         if (len < size - 1) {
             buf[len++] = (char)c;
@@ -82,12 +84,29 @@ int read_input(char *buf, int size, int digits) {
     return len;
 }
 
+char *map;
+off_t size;
+
+void timeout(int sig) {
+    (void)sig;
+
+    if (raw_mode)
+        tcsetattr(0, TCSANOW, &saved);
+
+    printf("\nвремя вышло\n%.*s\n", (int)size, map);
+    exit(0);
+}
+
 int main(void) {
     char filename[256];
 
-    printf("имя файла: ");
-    if (read_input(filename, sizeof(filename), 0) <= 0)
-        return 1;
+    int name_len;
+    do {
+        printf("имя файла: ");
+        name_len = read_input(filename, sizeof(filename), 0);
+        if (name_len < 0)
+            return 1;
+    } while (name_len == 0);
 
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
@@ -95,16 +114,30 @@ int main(void) {
         return 1;
     }
 
+    struct stat st;
+    fstat(fd, &st);
+    size = st.st_size;
+    if (size == 0) {
+        printf("файл пустой\n");
+        return 0;
+    }
+
+    map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        perror("ошибка mmap");
+        return 1;
+    }
+    close(fd);
+
     size_t capacity = 16;
     size_t line_count = 0;
     LineInfo *table = malloc(capacity * sizeof(LineInfo));
 
     off_t line_start = 0;
-    char ch;
 
-    while (read(fd, &ch, 1) > 0) {
-        if (ch == '\n') {
-            off_t pos = lseek(fd, 0L, 1);
+    for (off_t i = 0; i < size; i++) {
+        if (map[i] == '\n') {
+            off_t pos = i + 1;
 
             if (line_count == capacity) {
                 capacity *= 2;
@@ -121,8 +154,7 @@ int main(void) {
         }
     }
 
-    off_t file_size = lseek(fd, 0L, 1);
-    if (file_size > line_start) {
+    if (size > line_start) {
         if (line_count == capacity) {
             capacity += 1;
             LineInfo *tmp = realloc(table, capacity * sizeof(LineInfo));
@@ -130,7 +162,7 @@ int main(void) {
             table = tmp;
         }
         table[line_count].offset = line_start;
-        table[line_count].length = (size_t)(file_size - line_start);
+        table[line_count].length = (size_t)(size - line_start);
         line_count++;
     }
 
@@ -139,10 +171,15 @@ int main(void) {
         printf("%-8zu %-8lld %-8zu\n", i + 1, (long long)table[i].offset, table[i].length);
     printf("\n");
 
+    signal(SIGALRM, timeout);
+
     char input[10];
     while (1) {
-        printf("введите номер строки: ");
+        printf("введите номер строки (5 секунд): ");
+
+        alarm(5);
         int len = read_input(input, sizeof(input), 1);
+        alarm(0);
 
         if (len < 0)
             break;
@@ -163,20 +200,13 @@ int main(void) {
         }
 
         LineInfo *li = &table[n - 1];
-        char *buf = malloc(li->length + 1);
 
-        lseek(fd, li->offset, 0);
-        ssize_t r = read(fd, buf, li->length);
-        buf[r] = '\0';
-
-        printf("%s", buf);
-        if (r == 0 || buf[r - 1] != '\n')
+        printf("%.*s", (int)li->length, map + li->offset);
+        if (map[li->offset + li->length - 1] != '\n')
             printf("\n");
-
-        free(buf);
     }
 
     free(table);
-    close(fd);
+    munmap(map, size);
     return 0;
 }
