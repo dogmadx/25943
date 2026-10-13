@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <termios.h>
 
 #define MAXLEN 1024
 
@@ -9,34 +11,83 @@ struct node {
     struct node *next;
 };
 
-static void strip_ctrl(char *s)
+/*
+ * Читает одну строку в буфер по одному символу.
+ * Терминал переводится в "сырой" режим: он сам ничего не печатает,
+ * на экран выводим только то, что приняли в буфер.
+ * Стрелки, табы и прочие служебные клавиши пропускаются.
+ * Возвращает длину строки (вместе с '\n') или -1 при конце ввода (Ctrl+D, Ctrl+C).
+ */
+static int read_line(char *buf, int size)
 {
-    unsigned char *r = (unsigned char *)s;
-    unsigned char *w = r;
+    struct termios saved, raw;
+    int tty = isatty(0);
+    int len = 0;
+    int c;
 
-    while (*r) {
-        if (*r == 0x1B) {                       /* ESC */
-            r++;
-            if (*r == '[') {                    /* CSI: ESC [ параметры финальный_байт */
-                r++;
-                while (*r >= 0x20 && *r <= 0x3F) /* параметры и промежуточные байты */
-                    r++;
-                if (*r >= 0x40 && *r <= 0x7E)   /* финальный байт (A, B, C, D, ~ ...) */
-                    r++;
-            } else if (*r == 'O') {             /* SS3: ESC O x (стрелки/F1-F4) */
-                r++;
-                if (*r >= 0x40 && *r <= 0x7E)
-                    r++;
-            } else if (*r >= 0x20 && *r <= 0x7E) {
-                r++;                            /* ESC + один символ (Alt+клавиша) */
+    if (tty) {
+        tcgetattr(0, &saved);
+        raw = saved;
+        raw.c_lflag &= ~(ICANON | ECHO | ISIG); /* без построчного ввода, без эха, без Ctrl+C */
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        tcsetattr(0, TCSANOW, &raw);
+    }
+
+    while (1) {
+        c = getchar();
+
+        if (c == EOF || c == 4 || c == 3) {    /* конец ввода, Ctrl+D, Ctrl+C */
+            if (len == 0)
+                len = -1;                      /* пустая строка — значит ввод закончен */
+            break;
+        }
+
+        if (c == '\n' || c == '\r') {          /* Enter — строка готова */
+            if (tty)
+                putchar('\n');
+            buf[len++] = '\n';
+            break;
+        }
+
+        if (c == 0x7F || c == '\b') {          /* Backspace — стираем символ и с экрана */
+            /* русская буква занимает несколько байт: убираем их все */
+            while (len > 0 && ((unsigned char)buf[len - 1] & 0xC0) == 0x80)
+                len--;
+            if (len > 0) {
+                len--;
+                if (tty)
+                    printf("\b \b");
             }
-        } else if ((*r < 0x20 && *r != '\n' && *r != '\t') || *r == 0x7F) {
-            r++;                                /* прочие служебные символы */
-        } else {
-            *w++ = *r++;
+            fflush(stdout);
+            continue;
+        }
+
+        if (c == 0x1B) {                       /* стрелки и т.п.: ESC [ ... финальный байт */
+            c = getchar();
+            if (c == '[' || c == 'O')
+                while ((c = getchar()) != EOF && !(c >= 0x40 && c <= 0x7E))
+                    continue;
+            continue;
+        }
+
+        if (c < 0x20)                          /* таб и прочие служебные — не берём */
+            continue;
+
+        if (len < size - 2) {                  /* место под '\n' и '\0' */
+            buf[len++] = (char)c;
+            if (tty)
+                putchar(c);
+            fflush(stdout);
         }
     }
-    *w = '\0';
+
+    if (tty)
+        tcsetattr(0, TCSANOW, &saved);         /* возвращаем терминал как было */
+
+    if (len >= 0)
+        buf[len] = '\0';
+    return len;
 }
 
 int main(void)
@@ -44,13 +95,9 @@ int main(void)
     char buf[MAXLEN];
     struct node *head = NULL, *tail = NULL, *p, *next;
 
-    while (fgets(buf, sizeof buf, stdin) != NULL) {
-        strip_ctrl(buf);
-
-        if (buf[0] == '.')          /* проверяем уже очищенную строку */
+    while (read_line(buf, sizeof buf) >= 0) {
+        if (buf[0] == '.')
             break;
-        if (buf[0] == '\0')         /* от строки ничего не осталось */
-            continue;
 
         size_t len = strlen(buf);
 
