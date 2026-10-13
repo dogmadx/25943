@@ -13,6 +13,7 @@
 
 extern char **environ;
 
+/* строка -> неотрицательное число; -1 если это не число */
 int parse_number(const char *text, long *result) {
     char *end;
 
@@ -78,13 +79,12 @@ int set_max_processes(long value) {
     limit.rlim_cur = (rlim_t)value;
 
     if (setrlimit(RLIMIT_NPROC, &limit) == -1) {
-        perror("ошибка setrlimit");
+        printf("ulimit %ld: изменить нельзя\n", value);
         return -1;
     }
     return 0;
 #else
-    (void)value;
-    printf("изменение лимита процессов не поддерживается\n");
+    printf("ulimit %ld: изменить нельзя\n", value);
     return -1;
 #endif
 }
@@ -116,6 +116,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    /* сначала собираем все опции */
     int option;
     while ((option = getopt(argc, argv, options)) != -1) {
         if (option == '?') {
